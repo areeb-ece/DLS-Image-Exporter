@@ -32,10 +32,11 @@ outputs on the right), with feedback loops such as latches routed back around. P
 ordered to reduce wire crossings and lined up with whatever drives them, so most wires
 run straight. Wires are routed horizontally and vertically through the gaps between
 columns, each vertical run on its own track, and dots mark where a wire branches.
-Bit splitters and mergers (`8-1BIT`, `1-8BIT` and the 4-bit ones) are left out: a bus
-fans straight out into its single-bit wires where they branch off, and single-bit wires
-join back into a bus at a multi-bit pin. Each wire is traced through the splitters to the
-pin that really drives it. Layouts much wider than the target shape (`--aspect`,
+Bit splitters and mergers (`8-1BIT`, `1-8BIT` and the 4-bit ones) are left out. A bus is
+drawn as one wire per bit, close together and in bit order (highest bit on top, as the
+game lays out bus pins), and each bit peels off on its own toward where it goes, crossing
+the others where it has to. Single-bit wires join a bus at a multi-bit pin in the same
+bit order. Each wire is traced through the splitters to the pin that really drives it. Layouts much wider than the target shape (`--aspect`,
 default 1.8) wrap into rows, and every wire is still drawn whole: a wire crossing a row
 break runs down the right edge of its row, back along its own lane in the gap between
 rows, and into the next row from the left.
