@@ -1233,6 +1233,7 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
         return merged
 
     nets = {}
+    tgt_bit = {}  # (net, target pin) -> lowest bit of the target pin that the net drives
     for w in desc.get("Wires") or []:
         sk, tk = addr(w["SourcePinAddress"]), addr(w["TargetPinAddress"])
         et = pin_of.get(tk)
@@ -1245,6 +1246,7 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
             ts = nets.setdefault((bk, blo, bw), [])
             if tk not in ts:
                 ts.append(tk)
+                tgt_bit[((bk, blo, bw), tk)] = off
     nets = {k: sorted(v, key=str) for k, v in nets.items()}
 
     # ---- layering ----
@@ -1382,8 +1384,8 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
             attach(te.layer - 1, net, te, "R", t)
 
     # ---- bus fan-outs: a multi-bit pin whose bits go to different places ----
-    # Its wires leave (or arrive) as parallel lanes, one per bit, like the game draws a bus;
-    # each lane then peels off on its own. Lane order is decided once the tracks are known.
+    # Its wires leave (or arrive) as parallel lanes, one per bit in bit order (highest bit on
+    # top, as the game lays out bus pins), and each lane peels off on its own.
     fan_groups = {}
     for (c, net), g in groups.items():
         for a in g:
@@ -1391,10 +1393,13 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
                 fan_groups.setdefault((c, a.side, a.key), []).append(a)
     fan_groups = {k: v for k, v in fan_groups.items()
                   if v[0].elem.pins[k[2]][3] > 1 and (len(v) > 1 or v[0].net[2] < v[0].elem.pins[k[2]][3])}
-    for v in fan_groups.values():
-        span = sum(a.net[2] for a in v) * LANE
+    for (c, side, key), v in fan_groups.items():
+        pbits = v[0].elem.pins[key][3]
         for a in v:
-            a.fan = span
+            a.fan = pbits * LANE
+            first = a.net[1] if side == "L" else tgt_bit.get((a.net, key), 0)
+            centre_bit = first + (a.net[2] - 1) / 2
+            a.lane = ((pbits - 1) / 2 - centre_bit) * LANE  # layout y runs down: high bits above
 
     # ---- ordering within each column (barycentre sweeps, keep the best) ----
     for L in layers:
@@ -1619,43 +1624,6 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
         if a.key is not None:
             return (X(layer, col_x[layer] + a.elem.pins[a.key][1]), y)
         return (X(layer, col_x[layer] + col_w[layer]), y) if a.side == "L" else (X(layer, col_x[layer]), y)
-
-    # ---- fan lanes: order each fan's lanes so the peeling wires never cross each other.
-    # Leaving a pin: wires turning up take the top lanes, nearest turn outermost; wires turning
-    # down take the bottom lanes the same way. Arriving at a pin it's mirrored.
-    def turn_x(c, a):
-        if c in cut_set:
-            if a.side == "L":
-                return X(c, col_x[c] + col_w[c]) + cut_exit[(c, a.net)]
-            return X(c + 1, col_x[c + 1]) - entry_w[c] + cut_entry[(c, a.net)]
-        t = tracks_of.get((c, a.net))
-        return track_x(c, t) if t is not None else 0.0
-
-    def heading(c, a, g):
-        if c in cut_set and len({o.side for o in g}) == 2:
-            return 1.0 if a.side == "L" else -1.0  # row-break wires leave downward, arrive from above
-        others = [o.y() for o in g if o is not a]
-        return (sum(others) / len(others) - a.y()) if others else 0.0
-
-    group_of = {}
-    for (c, net), g in groups.items():
-        for a in g:
-            group_of[id(a)] = (c, g)
-    for (c, side, key), atts in fan_groups.items():
-        info = []
-        for a in atts:
-            cc, g = group_of[id(a)]
-            info.append((a, heading(cc, a, g), turn_x(cc, a)))
-        sign = 1 if side == "L" else -1
-        ups = sorted([i for i in info if i[1] < -1e-6], key=lambda i: sign * i[2])
-        mids = [i for i in info if abs(i[1]) <= 1e-6]
-        downs = sorted([i for i in info if i[1] > 1e-6], key=lambda i: -sign * i[2])
-        order = ups + mids + downs
-        n = sum(a.net[2] for a, _, _ in order)
-        pos = 0
-        for a, _, _ in order:
-            a.lane = (pos + a.net[2] / 2 - n / 2) * LANE
-            pos += a.net[2]
 
     # ---- emit the scene (world coordinates, y up) ----
     sc.tags = []
