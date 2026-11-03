@@ -365,8 +365,9 @@ class DevPin:
 
 
 class Wire:
-    def __init__(self, points, bits, colour, junction, depth):
+    def __init__(self, points, bits, colour, junction, depth, net=None):
         self.points, self.bits, self.colour, self.junction, self.depth = points, bits, colour, junction, depth
+        self.net = net
 
 
 class Link:
@@ -752,11 +753,16 @@ def pin_label(ctx, pin):
     text_label(ctx, pin.name, centre)
 
 
+_RENDER = {"split_buses": False}  # set per export, so pins match the wire style
+
+
 def draw_pin(ctx, pin):
     if pin.bits == 1:
         point(ctx, pin.pos, PIN_R, (0, 0, 0))
     else:
         h = PIN_H4 if pin.bits == 4 else PIN_H8
+        if _RENDER["split_buses"]:
+            h = max(h, pin.bits * LANE)  # tall enough to cover every bit's wire
         quad(ctx, pin.pos, (PIN_R * 2 * 0.95, h), (0, 0, 0))
 
 
@@ -819,7 +825,18 @@ def multibit_layout(pts, nbits, thick):
     return out
 
 
+WIRE_CASING = (0.06, 0.06, 0.07)
+
+
 def draw_wire(ctx, w, opts):
+    if getattr(opts, "split_buses", False):
+        # Auto layout: every bit is its own wire with a thin dark edge, buses spread slightly
+        # apart, so a bus reads as separate wires and each bit can peel off on its own.
+        lanes = [w.points] if w.bits == 1 else multibit_layout(w.points, w.bits, LANE / (2 * 0.925))
+        for bi, bpts in enumerate(lanes):
+            polyline(ctx, bpts, WIRE_T * 2 + 0.022, WIRE_CASING)
+            polyline(ctx, bpts, WIRE_T * 2, wire_col(w.colour, opts))
+        return
     if w.bits == 1:
         col = wire_col(w.colour, opts)
         polyline(ctx, w.points, WIRE_T * 2, col)
@@ -902,7 +919,11 @@ def render_scene(ctx, sc, opts):
     for w in sc.wires:
         draw_wire(ctx, w, opts)
     for p, bits, col in getattr(sc, "dots", []):
-        point(ctx, p, 0.06 if bits == 1 else bundle_width(bits) * 0.7, wire_col(col, opts))
+        if bits == 1:
+            point(ctx, p, 0.06, wire_col(col, opts))
+        else:  # bus branch: a small dark-edged bar across the bus, not a blob over its bits
+            quad(ctx, p, (0.13, bundle_width(bits) + 0.05), WIRE_CASING)
+            quad(ctx, p, (0.08, bundle_width(bits)), wire_col(col, opts))
 
     for c in sc.chips:
         if c.inner:
@@ -918,7 +939,10 @@ def render_scene(ctx, sc, opts):
     for ln in sc.links:
         if ln.colour is not None:
             # square ends, so a thick bus doesn't spill over the pin's name tag
-            polyline(ctx, [ln.a, ln.b], bundle_width(ln.bits), wire_col(ln.colour, opts), cap=cairo.LINE_CAP_BUTT)
+            if getattr(opts, "split_buses", False):
+                draw_wire(ctx, Wire([ln.a, ln.b], ln.bits, ln.colour, None, 0), opts)
+            else:
+                polyline(ctx, [ln.a, ln.b], bundle_width(ln.bits), wire_col(ln.colour, opts), cap=cairo.LINE_CAP_BUTT)
     ctx.save()
     ctx.set_dash([0.06, 0.05])
     for ln in sc.links:
@@ -1004,12 +1028,13 @@ DUMMY_GAP = 0.1
 CHANNEL_MARGIN = 0.16
 MIN_CHANNEL = 0.36
 TRACK_SEP = 0.12
+LANE = 0.06  # spacing of the bits in a bus (a little wider than the game's, so each bit stands apart)
 FOLD_MIN_W = 14.0
 BAND_GAP = 0.8
 
 
 def bundle_width(bits):
-    return WIRE_T * 2 * (1 if bits == 1 else bits * 0.925)
+    return WIRE_T * 2 if bits == 1 else bits * LANE
 
 
 def track_width(bits):
@@ -1044,10 +1069,12 @@ class _Elem:
 
 
 class _Att:
-    __slots__ = ("elem", "side", "key", "net")
+    __slots__ = ("elem", "side", "key", "net", "lane", "fan")
 
     def __init__(self, elem, side, key, net):
         self.elem, self.side, self.key, self.net = elem, side, key, net
+        self.lane = 0.0  # offset from the pin centre when a bus fans out into separate wires
+        self.fan = 0.0  # height of the whole fan at this pin (0 when the wire isn't part of one)
 
     def yoff(self):
         return self.elem.pins[self.key][2] if self.key is not None else self.elem.h / 2
@@ -1056,7 +1083,7 @@ class _Att:
         return self.yoff() / self.elem.h if self.elem.h > 0 else 0.5
 
     def y(self):
-        return self.elem.y + self.yoff()
+        return self.elem.y + self.yoff() + self.lane
 
 
 def _isotonic_place(elems, desired, weights, gap_fn):
@@ -1354,6 +1381,21 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
             te = pin_of[t]
             attach(te.layer - 1, net, te, "R", t)
 
+    # ---- bus fan-outs: a multi-bit pin whose bits go to different places ----
+    # Its wires leave (or arrive) as parallel lanes, one per bit, like the game draws a bus;
+    # each lane then peels off on its own. Lane order is decided once the tracks are known.
+    fan_groups = {}
+    for (c, net), g in groups.items():
+        for a in g:
+            if a.key is not None:
+                fan_groups.setdefault((c, a.side, a.key), []).append(a)
+    fan_groups = {k: v for k, v in fan_groups.items()
+                  if v[0].elem.pins[k[2]][3] > 1 and (len(v) > 1 or v[0].net[2] < v[0].elem.pins[k[2]][3])}
+    for v in fan_groups.values():
+        span = sum(a.net[2] for a in v) * LANE
+        for a in v:
+            a.fan = span
+
     # ---- ordering within each column (barycentre sweeps, keep the best) ----
     for L in layers:
         L.sort(key=lambda e: -e.orig[1])
@@ -1441,10 +1483,11 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
         for net, g in items:
             ys = [a.y() for a in g]
             sides = {a.side for a in g}
-            if len(g) == 2 and len(sides) == 2 and abs(ys[0] - ys[1]) < 1e-6:
+            if len(g) == 2 and len(sides) == 2 and abs(ys[0] - ys[1]) < 1e-6 and not any(a.fan for a in g):
                 tracks_of[(c, net)] = None
                 continue
-            need[net] = (min(ys), max(ys), net_bits(g))
+            # leave room for whichever fan lane each pin's wire ends up on
+            need[net] = (min(a.y() - a.fan / 2 for a in g), max(a.y() + a.fan / 2 for a in g), net_bits(g))
             for a in g:
                 at_y.setdefault(round(a.y(), 5), []).append((net, a.side))
         before = {n: set() for n in need}
@@ -1577,6 +1620,43 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
             return (X(layer, col_x[layer] + a.elem.pins[a.key][1]), y)
         return (X(layer, col_x[layer] + col_w[layer]), y) if a.side == "L" else (X(layer, col_x[layer]), y)
 
+    # ---- fan lanes: order each fan's lanes so the peeling wires never cross each other.
+    # Leaving a pin: wires turning up take the top lanes, nearest turn outermost; wires turning
+    # down take the bottom lanes the same way. Arriving at a pin it's mirrored.
+    def turn_x(c, a):
+        if c in cut_set:
+            if a.side == "L":
+                return X(c, col_x[c] + col_w[c]) + cut_exit[(c, a.net)]
+            return X(c + 1, col_x[c + 1]) - entry_w[c] + cut_entry[(c, a.net)]
+        t = tracks_of.get((c, a.net))
+        return track_x(c, t) if t is not None else 0.0
+
+    def heading(c, a, g):
+        if c in cut_set and len({o.side for o in g}) == 2:
+            return 1.0 if a.side == "L" else -1.0  # row-break wires leave downward, arrive from above
+        others = [o.y() for o in g if o is not a]
+        return (sum(others) / len(others) - a.y()) if others else 0.0
+
+    group_of = {}
+    for (c, net), g in groups.items():
+        for a in g:
+            group_of[id(a)] = (c, g)
+    for (c, side, key), atts in fan_groups.items():
+        info = []
+        for a in atts:
+            cc, g = group_of[id(a)]
+            info.append((a, heading(cc, a, g), turn_x(cc, a)))
+        sign = 1 if side == "L" else -1
+        ups = sorted([i for i in info if i[1] < -1e-6], key=lambda i: sign * i[2])
+        mids = [i for i in info if abs(i[1]) <= 1e-6]
+        downs = sorted([i for i in info if i[1] > 1e-6], key=lambda i: -sign * i[2])
+        order = ups + mids + downs
+        n = sum(a.net[2] for a, _, _ in order)
+        pos = 0
+        for a, _, _ in order:
+            a.lane = (pos + a.net[2] / 2 - n / 2) * LANE
+            pos += a.net[2]
+
     # ---- emit the scene (world coordinates, y up) ----
     sc.tags = []
     for L in layers:
@@ -1585,7 +1665,7 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
             if e.kind == "dummy":
                 y = Y(e.layer, e.y + e.h / 2)
                 col = pin_colour_of(pin_of, e.net)
-                sc.wires.append(Wire([(x0, y), (x0 + col_w[e.layer], y)], e.bits, col, None, 0))
+                sc.wires.append(Wire([(x0, y), (x0 + col_w[e.layer], y)], e.bits, col, None, 0, e.net))
             elif e.kind == "chip":
                 s, cd, body, inner = e.payload
                 c = Chip()
@@ -1634,12 +1714,12 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
         ys = [p[1] for _, p in atts_pts] + ([through] if through is not None else [])
         ymin, ymax = min(ys), max(ys)
         if ymax - ymin > 1e-9:
-            sc.wires.append(Wire([(tx, ymin), (tx, ymax)], bits, col, None, 0))
+            sc.wires.append(Wire([(tx, ymin), (tx, ymax)], bits, col, None, 0, atts_pts[0][0].net))
         count = {}
         for y in ys:
             count[round(y, 5)] = count.get(round(y, 5), 0) + 1
         for _, (x, y) in atts_pts:
-            sc.wires.append(Wire(_dedupe([(x, y), (tx, y)]), bits, col, None, 0))
+            sc.wires.append(Wire(_dedupe([(x, y), (tx, y)]), bits, col, None, 0, atts_pts[0][0].net))
             if ymin + 1e-6 < y < ymax - 1e-6 or count[round(y, 5)] > 1:
                 sc.dots.append(((tx, y), bits, col))
         note_turns(atts_pts, tx)
@@ -1658,12 +1738,12 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
                 if len(left) == 1 and len(right) == 1:
                     (xl, yl), (xr, yr) = left[0][1], right[0][1]
                     sc.wires.append(Wire(_dedupe([(xl, yl), (xt, yl), (xt, gy), (xs, gy), (xs, yr), (xr, yr)]),
-                                         bits, col, None, 0))
+                                         bits, col, None, 0, net))
                     note_turns(left, xt)
                     note_turns(right, xs)
                 else:
                     trunk(xt, left, bits, col, through=gy)
-                    sc.wires.append(Wire([(xt, gy), (xs, gy)], bits, col, None, 0))
+                    sc.wires.append(Wire([(xt, gy), (xs, gy)], bits, col, None, 0, net))
                     trunk(xs, right, bits, col, through=gy)
             elif left:
                 trunk(xt, left, bits, col)
@@ -1672,33 +1752,20 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
             continue
         t = tracks_of.get((c, net))
         if t is None:
-            sc.wires.append(Wire([p for _, p in ap], bits, col, None, 0))
+            sc.wires.append(Wire([p for _, p in ap], bits, col, None, 0, net))
             for (a, p), (_, q) in ((ap[0], ap[1]), (ap[1], ap[0])):
                 note_turns([(a, p)], q[0])
             continue
         tx = track_x(c, t)
         if len(ap) == 2:
             (x1, y1), (x2, y2) = ap[0][1], ap[1][1]
-            sc.wires.append(Wire(_dedupe([(x1, y1), (tx, y1), (tx, y2), (x2, y2)]), bits, col, None, 0))
+            sc.wires.append(Wire(_dedupe([(x1, y1), (tx, y1), (tx, y2), (x2, y2)]), bits, col, None, 0, net))
             note_turns(ap, tx)
             continue
         trunk(tx, ap, bits, col)
 
-    # Where a bus splits into narrower wires (or narrower wires merge into a bus), draw the bus
-    # itself up to the furthest point where a wire peels off, under the thinner wires.
-    bundles = []
-    for key, lst in pin_turns.items():
-        e = pin_of[key]
-        side, _, _, pbits, colour, _ = e.pins[key]
-        nets_here = {n for _, n, _ in lst}
-        if pbits == 1 or (len(nets_here) < 2 and all(n[2] == pbits for n in nets_here)):
-            continue
-        px, py = lst[0][2]
-        xs_ = [x for x, _, _ in lst]
-        far = max(xs_) if side == "out" else min(xs_)
-        bundles.append(Wire(_dedupe([(px, py), (far, py)]), pbits, colour, None, 0))
-    sc.wires[:0] = bundles
 
+    sc.wires = join_wire_pieces(sc.wires)
     sc.bbox = scene_bbox(sc, opts)
     extra = [(p.x0, p.y) for p in sc.ports] + [(p.x1, p.y) for p in sc.ports]
     if extra:
@@ -1707,6 +1774,53 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
         sc.bbox = [min(sc.bbox[0], min(xs)), min(sc.bbox[1], min(ys) - 0.15),
                    max(sc.bbox[2], max(xs)), max(sc.bbox[3], max(ys) + 0.15)]
     return sc
+
+
+def join_wire_pieces(wires):
+    """Join a net's wire pieces that meet end to end (with no branch there) into one line, so
+    each bit is drawn as a single continuous wire with clean corners."""
+    out, by_net = [], {}
+    for w in wires:
+        if w.net is None:
+            out.append(w)
+        else:
+            by_net.setdefault(w.net, []).append(w)
+
+    def k(p):
+        return (round(p[0], 5), round(p[1], 5))
+
+    for net, ws in by_net.items():
+        polys = [list(w.points) for w in ws]
+        while True:
+            ends, inner = {}, set()
+            for pl in polys:
+                for p in (pl[0], pl[-1]):
+                    ends[k(p)] = ends.get(k(p), 0) + 1
+                inner.update(k(p) for p in pl[1:-1])
+            done = False
+            for i, a in enumerate(polys):
+                for j, b in enumerate(polys):
+                    if i == j:
+                        continue
+                    for aa in (a, a[::-1]):
+                        for bb in (b, b[::-1]):
+                            kk = k(aa[-1])
+                            if kk == k(bb[0]) and ends[kk] == 2 and kk not in inner:
+                                polys[i] = aa + bb[1:]
+                                del polys[j]
+                                done = True
+                                break
+                        if done:
+                            break
+                    if done:
+                        break
+                if done:
+                    break
+            if not done:
+                break
+        for pl in polys:
+            out.append(Wire(_dedupe(pl), ws[0].bits, ws[0].colour, None, 0, net))
+    return out
 
 
 def net_bits(g):
@@ -1729,7 +1843,7 @@ def _dedupe(pts):
 
 def draw_port(ctx, p, opts):
     col = wire_col(p.colour, opts)
-    polyline(ctx, [(p.x0, p.y), (p.x1, p.y)], bundle_width(p.bits), col, cap=cairo.LINE_CAP_BUTT)
+    draw_wire(ctx, Wire([(p.x0, p.y), (p.x1, p.y)], p.bits, p.colour, None, 0), opts)
     draw_pin(ctx, Pin(p.pin_pos, p.pin_pos, p.bits, p.is_input, p.colour, p.name, 1))
     if p.show_name and p.name.strip():
         w = text_width(p.name, FONT_PIN) + LABEL_PAD[0]
@@ -1756,6 +1870,7 @@ def export_scene(sc, opts, png_path=None, svg_path=None, ppu=100, max_px=16000, 
         notes.append(f"downscaled to {eff:.0f} px/unit to stay under {max_px}px")
 
     def paint(surface, scale):
+        _RENDER["split_buses"] = getattr(opts, "split_buses", False)
         ctx = cairo.Context(surface)
         rgb(ctx, BG)
         ctx.paint()
@@ -1875,6 +1990,7 @@ def main(argv=None):
                 auto_cache = {}
                 try:
                     layout = args.layout or ("auto" if mode == "expanded" else "original")
+                    opts.split_buses = layout == "auto"
                     sc = (build_auto_scene(lib, desc, opts, cache=auto_cache) if layout == "auto"
                           else build_scene(lib, desc, opts))
                     frames = 0
