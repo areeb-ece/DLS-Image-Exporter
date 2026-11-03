@@ -32,9 +32,13 @@ outputs on the right), with feedback loops such as latches routed back around. P
 ordered to reduce wire crossings and lined up with whatever drives them, so most wires
 run straight. Wires are routed horizontally and vertically through the gaps between
 columns, each vertical run on its own track, and dots mark where a wire branches.
-Layouts much wider than the target shape (`--aspect`, default 1.8) wrap into rows; a
-wire that crosses a row break ends in a named tag (`N3 >`) and continues from the
-matching tag (`> N3`) on the next row.
+Bit splitters and mergers (`8-1BIT`, `1-8BIT` and the 4-bit ones) are left out: a bus
+fans straight out into its single-bit wires where they branch off, and single-bit wires
+join back into a bus at a multi-bit pin. Each wire is traced through the splitters to the
+pin that really drives it. Layouts much wider than the target shape (`--aspect`,
+default 1.8) wrap into rows, and every wire is still drawn whole: a wire crossing a row
+break runs down the right edge of its row, back along its own lane in the gap between
+rows, and into the next row from the left.
 
 ## Common commands
 
@@ -50,7 +54,8 @@ python3 dls_export.py --mode expanded --collapse AND,OR,NOT   # keep these chips
 python3 dls_export.py --lit                   # bright wire colours (easier to see)
 ```
 
-Other flags: `--aspect` (row wrapping for the auto layout; `0` turns it off), `--scale`
+Other flags: `--aspect` (row wrapping for the auto layout; `0` turns it off),
+`--keep-splitters` (auto layout: draw the splitter and merger chips after all), `--scale`
 (pixels per unit, default 100), `--max-px` (PNG size cap, default 16000; larger images
 are scaled down, so use `--format svg` for very big chips), `--grid`, `--no-pin-names`,
 `--chip-pin-names`, `--out DIR`, `--font FAMILY`.
