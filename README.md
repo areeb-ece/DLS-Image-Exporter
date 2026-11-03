@@ -17,29 +17,36 @@ Windows/macOS locations; point `--saves` somewhere else if needed.
 
 | Mode       | Output folder                  | What it shows |
 |------------|--------------------------------|---------------|
-| `circuit`  | `exports/<project>/circuit/`   | The inside of each chip, as you laid it out in the editor |
+| `circuit`  | `exports/<project>/circuit/`   | The inside of each chip |
 | `expanded` | `exports/<project>/expanded/`  | Every custom sub-chip opened up in place, recursively. Each one becomes a bordered frame, titled with the chip's name, holding its own inner circuit |
 
 ## Layouts
 
-| Layout     | Default for | What it does |
-|------------|-------------|--------------|
-| `original` | `circuit`   | Keeps your placement and your wire bends. In expanded mode, the space around each opened chip is stretched to make room, so straight wires stay straight |
-| `auto`     | `expanded`  | Rearranges the parts and re-routes the wires to use far less space, so gates are readable without zooming in |
+| Layout     | What it does |
+|------------|--------------|
+| `auto` (default) | Rearranges the parts and re-routes the wires so the circuit is easy to follow, and uses far less space, so gates are readable without zooming in |
+| `original` | Keeps your placement and your wire bends. In expanded mode, the space around each opened chip is stretched to make room, so straight wires stay straight |
 
 The auto layout places each chip's parts in columns by signal flow (inputs on the left,
 outputs on the right), with feedback loops such as latches routed back around. Parts are
 ordered to reduce wire crossings and lined up with whatever drives them, so most wires
 run straight. Wires are routed horizontally and vertically through the gaps between
-columns, each vertical run on its own track, and dots mark where a wire branches.
-Bit splitters and mergers (`8-1BIT`, `1-8BIT` and the 4-bit ones) are left out. A bus is
-drawn as one wire per bit, close together and in bit order (highest bit on top, as the
-game lays out bus pins), and each bit peels off on its own toward where it goes, crossing
-the others where it has to. Single-bit wires join a bus at a multi-bit pin in the same
-bit order. Each wire is traced through the splitters to the pin that really drives it. Layouts much wider than the target shape (`--aspect`,
-default 1.8) wrap into rows, and every wire is still drawn whole: a wire crossing a row
-break runs down the right edge of its row, back along its own lane in the gap between
-rows, and into the next row from the left.
+columns, each vertical run on its own track, and dots mark where a wire branches. After
+placing the parts, it nudges them wherever there's room so that more wires run dead level
+instead of taking small jogs.
+Bit splitters and mergers (`8-1BIT`, `1-8BIT` and the 4-bit ones) are left out. A bus
+whose bits all go to the same place is drawn as one thick wire with a dark centre line.
+Where a bus splits up, it's drawn as one wire per bit, close together and in bit order
+(highest bit on top, as the game lays out bus pins), and each bit peels off on its own
+toward where it goes, crossing the others where it has to. Single-bit wires join a bus at a multi-bit pin in the same
+bit order. Each wire is traced through the splitters to the pin that really drives it.
+
+Layouts much wider than the target shape (`--aspect`, default 1.8) can wrap into rows,
+and every wire is still drawn whole: a wire crossing a row break runs down the right edge
+of its row, back along its own lane in the gap between rows, and into the next row from
+the left. Because those looping wires cost space and clarity, a layout only wraps when
+the better shape outweighs them, so a small chip whose wires mostly cross the break
+(like an 8-bit ripple-carry adder) stays in one long row.
 
 ## Common commands
 
@@ -49,7 +56,7 @@ python3 dls_export.py --list                  # list projects and chips
 python3 dls_export.py -p ALU                  # one project
 python3 dls_export.py -p ALU -c ALU "FULL ADDER"           # specific chips
 python3 dls_export.py -p ALU --mode expanded --format svg   # vector output
-python3 dls_export.py --mode expanded --layout original    # keep your own layout
+python3 dls_export.py --layout original      # keep your own layout
 python3 dls_export.py --mode expanded --depth 1            # open only one level
 python3 dls_export.py --mode expanded --collapse AND,OR,NOT   # keep these chips closed
 python3 dls_export.py --lit                   # bright wire colours (easier to see)

@@ -9,6 +9,10 @@ Two render modes:
             that holds its own inner circuit, so you can see all the parts
             a component is built from.
 
+Both modes use the auto layout by default: the parts are re-placed in columns by
+signal flow and the wires re-routed so they're easy to follow. --layout original
+keeps your own placement and wire bends instead.
+
 It reads the game's save files directly (it doesn't touch them), and it copies
 the game's layout rules (pin spacing, chip sizes, built-in chips, wire
 geometry) from the public DLS source so that wires meet pins where they do
@@ -365,8 +369,9 @@ class DevPin:
 
 
 class Wire:
-    def __init__(self, points, bits, colour, junction, depth, net=None):
+    def __init__(self, points, bits, colour, junction, depth, net=None, solid=False):
         self.points, self.bits, self.colour, self.junction, self.depth = points, bits, colour, junction, depth
+        self.solid = solid
         self.net = net
 
 
@@ -831,7 +836,13 @@ WIRE_CASING = (0.06, 0.06, 0.07)
 def draw_wire(ctx, w, opts):
     if getattr(opts, "split_buses", False):
         # Auto layout: every bit is its own wire with a thin dark edge, buses spread slightly
-        # apart, so a bus reads as separate wires and each bit can peel off on its own.
+        # apart, so a bus reads as separate wires and each bit can peel off on its own. A bus
+        # whose bits all go to the same place is one solid band with a dark centre line instead.
+        if w.solid and w.bits > 1:
+            polyline(ctx, w.points, BUS_W + 0.03, WIRE_CASING)
+            polyline(ctx, w.points, BUS_W, wire_col(w.colour, opts))
+            polyline(ctx, w.points, 0.025, darken(wire_col(w.colour, opts), 1.8))
+            return
         lanes = [w.points] if w.bits == 1 else multibit_layout(w.points, w.bits, LANE / (2 * 0.925))
         for bi, bpts in enumerate(lanes):
             polyline(ctx, bpts, WIRE_T * 2 + 0.022, WIRE_CASING)
@@ -918,12 +929,13 @@ def draw_frame(ctx, c, opts, title):
 def render_scene(ctx, sc, opts):
     for w in sc.wires:
         draw_wire(ctx, w, opts)
-    for p, bits, col in getattr(sc, "dots", []):
+    for p, bits, col, *solid in getattr(sc, "dots", []):
         if bits == 1:
             point(ctx, p, 0.06, wire_col(col, opts))
         else:  # bus branch: a small dark-edged bar across the bus, not a blob over its bits
-            quad(ctx, p, (0.13, bundle_width(bits) + 0.05), WIRE_CASING)
-            quad(ctx, p, (0.08, bundle_width(bits)), wire_col(col, opts))
+            bw = bundle_width(bits, bool(solid and solid[0]))
+            quad(ctx, p, (0.13, bw + 0.05), WIRE_CASING)
+            quad(ctx, p, (0.08, bw), wire_col(col, opts))
 
     for c in sc.chips:
         if c.inner:
@@ -940,7 +952,7 @@ def render_scene(ctx, sc, opts):
         if ln.colour is not None:
             # square ends, so a thick bus doesn't spill over the pin's name tag
             if getattr(opts, "split_buses", False):
-                draw_wire(ctx, Wire([ln.a, ln.b], ln.bits, ln.colour, None, 0), opts)
+                draw_wire(ctx, Wire([ln.a, ln.b], ln.bits, ln.colour, None, 0, solid=getattr(ln, "solid", False)), opts)
             else:
                 polyline(ctx, [ln.a, ln.b], bundle_width(ln.bits), wire_col(ln.colour, opts), cap=cairo.LINE_CAP_BUTT)
     ctx.save()
@@ -1033,12 +1045,17 @@ FOLD_MIN_W = 14.0
 BAND_GAP = 0.8
 
 
-def bundle_width(bits):
-    return WIRE_T * 2 if bits == 1 else bits * LANE
+BUS_W = 0.16  # a bus whose bits all travel together: drawn as one solid band
 
 
-def track_width(bits):
-    return max(0.13, bundle_width(bits) + 0.09)
+def bundle_width(bits, solid=False):
+    if bits == 1:
+        return WIRE_T * 2
+    return BUS_W if solid else bits * LANE
+
+
+def track_width(bits, solid=False):
+    return max(0.13, bundle_width(bits, solid) + 0.09)
 
 
 class Port:
@@ -1400,6 +1417,15 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
             first = a.net[1] if side == "L" else tgt_bit.get((a.net, key), 0)
             centre_bit = first + (a.net[2] - 1) / 2
             a.lane = ((pbits - 1) / 2 - centre_bit) * LANE  # layout y runs down: high bits above
+    fanned = {a.net for v in fan_groups.values() for a in v}
+
+    def solid(net):
+        return net[2] > 1 and net not in fanned
+
+    for L in layers:
+        for d in L:
+            if d.kind == "dummy":
+                d.h = bundle_width(d.bits, solid(d.net)) + 0.02
 
     # ---- ordering within each column (barycentre sweeps, keep the best) ----
     for L in layers:
@@ -1471,6 +1497,39 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
                 desired.append(sum(vals) / len(vals) if vals else e.y)
                 weights.append(len(vals) if vals else 0.05)
             _isotonic_place(L, desired, weights, _gap)
+
+    # ---- straighten: nudge parts so more wires run dead level (no small jogs) ----
+    def level_pairs(e):
+        """(own, other) for each plain point-to-point wire of e, the ones that can be straight."""
+        return [(own, o) for g, own in e.atts if len(g) == 2 and not any(a.fan for a in g)
+                for o in g if o is not own]
+
+    def n_level(e):
+        return sum(1 for own, o in level_pairs(e) if abs(own.y() - o.y()) < 1e-6)
+
+    for it in range(6):
+        moved = False
+        order = range(n_layers) if it % 2 == 0 else range(n_layers - 1, -1, -1)
+        for li in order:
+            L = layers[li]
+            for i, e in enumerate(L):
+                lo = L[i - 1].y + L[i - 1].h + _gap(L[i - 1], e) if i > 0 else -float("inf")
+                hi = L[i + 1].y - _gap(e, L[i + 1]) - e.h if i + 1 < len(L) else float("inf")
+                y0, best = e.y, (n_level(e), 0.0)
+                cands = {round(o.y() - (own.y() - e.y), 6) for own, o in level_pairs(e)}
+                best_y = y0
+                for y in cands:
+                    if not (lo - 1e-9 <= y <= hi + 1e-9) or abs(y - y0) > 1.5:
+                        continue
+                    e.y = y
+                    score = (n_level(e), -abs(y - y0))
+                    if score > best:
+                        best, best_y = score, y
+                    e.y = y0
+                if best_y != y0:
+                    e.y, moved = best_y, True
+        if not moved:
+            break
     top = min((e.y for e in elems + [d for L in layers for d in L]), default=0.0)
     for L in layers:
         for e in L:
@@ -1514,12 +1573,12 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
             w = 0.0
             for n in avail:
                 lo, hi, bits = need[n]
-                pad = TRACK_SEP + bundle_width(bits) / 2
+                pad = TRACK_SEP + bundle_width(bits, solid(n)) / 2
                 if lo > last_hi + pad:
                     assigned[n] = t
                     remaining.discard(n)
-                    last_hi = hi + bundle_width(bits) / 2
-                    w = max(w, track_width(bits))
+                    last_hi = hi + bundle_width(bits, solid(n)) / 2
+                    w = max(w, track_width(bits, solid(n)))
             widths.append(w)
         for n, t in assigned.items():
             tracks_of[(c, n)] = t
@@ -1537,26 +1596,38 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
     band_of = [0] * n_layers
     cuts = []
     if opts.aspect and n_layers > 3 and total_w > FOLD_MIN_W and total_h > 0 and total_w / total_h > opts.aspect * 1.5:
-        best_k, best_score = 1, abs(math.log(total_w / total_h / opts.aspect))
-        for k in range(2, min(12, n_layers - 2) + 1):
-            wk = total_w / k + 1.5
-            hk = k * total_h + (k - 1) * BAND_GAP
-            score = abs(math.log(wk / hk / opts.aspect))
-            if score < best_score:
-                best_k, best_score = k, score
-        if best_k > 1:
-            n_in_chan = {}
-            for (c, net) in groups:
-                n_in_chan[c] = n_in_chan.get(c, 0) + 1
+        # Every wire crossing a row break has to loop around through the gap between rows, which
+        # costs space and clarity, so a wrap only wins when it improves the shape by enough.
+        n_in_chan, w_in_chan = {}, {}
+        for (c, net) in groups:
+            n_in_chan[c] = n_in_chan.get(c, 0) + 1
+            w_in_chan[c] = w_in_chan.get(c, 0.0) + track_width(net[2], solid(net))
+
+        def pick_cuts(k):
             used = set()
-            for j in range(1, best_k):
-                target = total_w * j / best_k
+            for j in range(1, k):
+                target = total_w * j / k
                 cands = [c for c in range(1, n_layers - 2) if c not in used] or [c for c in range(n_layers - 1) if c not in used]
                 if not cands:
                     break
                 used.add(min(cands, key=lambda c: abs(col_x[c] + col_w[c] + chan_w[c] / 2 - target) / total_w * 10
                                                   + 0.12 * n_in_chan.get(c, 0)))
-            cuts = sorted(used)
+            return sorted(used)
+
+        best_cuts, best_score = [], abs(math.log(total_w / total_h / opts.aspect))
+        for k in range(2, min(12, n_layers - 2) + 1):
+            ck = pick_cuts(k)
+            if len(ck) != k - 1:
+                break
+            wk = total_w / k + 1.5 + 2 * max(w_in_chan.get(c, 0.0) for c in ck)
+            hk = k * total_h + sum(BAND_GAP + w_in_chan.get(c, 0.0) for c in ck)
+            n_cross = sum(n_in_chan.get(c, 0) for c in ck)
+            # share of the picture the looping wires would take up (each runs about a row's width)
+            loop_share = sum(w_in_chan.get(c, 0.0) for c in ck) / (k * total_h)
+            score = abs(math.log(wk / hk / opts.aspect)) + 5.0 * loop_share + 0.02 * n_cross
+            if score < best_score:
+                best_cuts, best_score = ck, score
+        cuts = best_cuts
     b = 0
     for li in range(n_layers):
         band_of[li] = b
@@ -1579,7 +1650,7 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
     def stack_tracks(c, seq, store):
         pos = CHANNEL_MARGIN
         for n, g in seq:
-            tw = track_width(n[2])
+            tw = track_width(n[2], solid(n))
             store[(c, n)] = pos + tw / 2
             pos += tw
         return pos + CHANNEL_MARGIN
@@ -1653,8 +1724,10 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
                         port = inner.ports_by_id.get(p["ID"])
                         if port:
                             ox, oy = port.outer_pos
-                            sc.links.append(Link(pin.pos, (ox + c.inner_offset[0], oy + c.inner_offset[1]),
-                                                 colour=pin.colour if pin.is_source else port.colour, bits=pin.bits))
+                            ln = Link(pin.pos, (ox + c.inner_offset[0], oy + c.inner_offset[1]),
+                                      colour=pin.colour if pin.is_source else port.colour, bits=pin.bits)
+                            ln.solid = port.solid
+                            sc.links.append(ln)
                 sc.chips.append(c)
             elif e.kind == "devpin":
                 p, is_input, hx = e.payload
@@ -1666,6 +1739,7 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
                 p, is_input, show = e.payload
                 port = Port(p.get("Name", ""), x0, x0 + e.w, Y(e.layer, e.y + e.h / 2), p.get("BitCount", 1),
                             p.get("Colour", 0) or 0, is_input, show)
+                port.solid = port.bits > 1 and all(solid(own.net) for _, own in e.atts)
                 sc.ports.append(port)
                 sc.ports_by_id[p["ID"]] = port
 
@@ -1689,7 +1763,7 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
         for _, (x, y) in atts_pts:
             sc.wires.append(Wire(_dedupe([(x, y), (tx, y)]), bits, col, None, 0, atts_pts[0][0].net))
             if ymin + 1e-6 < y < ymax - 1e-6 or count[round(y, 5)] > 1:
-                sc.dots.append(((tx, y), bits, col))
+                sc.dots.append(((tx, y), bits, col, solid(atts_pts[0][0].net)))
         note_turns(atts_pts, tx)
 
     for (c, net), g in groups.items():
@@ -1734,6 +1808,8 @@ def build_auto_scene(lib, desc, opts, depth=0, stack=frozenset(), cache=None, ro
 
 
     sc.wires = join_wire_pieces(sc.wires)
+    for w in sc.wires:
+        w.solid = w.net is not None and solid(w.net)
     sc.bbox = scene_bbox(sc, opts)
     extra = [(p.x0, p.y) for p in sc.ports] + [(p.x1, p.y) for p in sc.ports]
     if extra:
@@ -1811,7 +1887,7 @@ def _dedupe(pts):
 
 def draw_port(ctx, p, opts):
     col = wire_col(p.colour, opts)
-    draw_wire(ctx, Wire([(p.x0, p.y), (p.x1, p.y)], p.bits, p.colour, None, 0), opts)
+    draw_wire(ctx, Wire([(p.x0, p.y), (p.x1, p.y)], p.bits, p.colour, None, 0, solid=getattr(p, "solid", False)), opts)
     draw_pin(ctx, Pin(p.pin_pos, p.pin_pos, p.bits, p.is_input, p.colour, p.name, 1))
     if p.show_name and p.name.strip():
         w = text_width(p.name, FONT_PIN) + LABEL_PAD[0]
@@ -1892,7 +1968,7 @@ def main(argv=None):
                     help="output folder (default: ./exports next to this script)")
     ap.add_argument("--layout", choices=["auto", "original"], default=None,
                     help="auto = rearrange parts and re-route wires compactly; original = keep your layout "
-                         "(default: auto for expanded, original for circuit)")
+                         "(default: auto)")
     ap.add_argument("--aspect", type=float, default=1.8,
                     help="auto layout: wrap layouts much wider than this width/height ratio into rows "
                          "(default 1.8; 0 = never wrap)")
@@ -1957,7 +2033,7 @@ def main(argv=None):
                 desc = lib.custom[name]
                 auto_cache = {}
                 try:
-                    layout = args.layout or ("auto" if mode == "expanded" else "original")
+                    layout = args.layout or "auto"
                     opts.split_buses = layout == "auto"
                     sc = (build_auto_scene(lib, desc, opts, cache=auto_cache) if layout == "auto"
                           else build_scene(lib, desc, opts))
